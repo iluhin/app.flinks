@@ -1,0 +1,203 @@
+# Публикация выпуска Flinks.
+#
+# Actions → «Публикация выпуска» → Run workflow. Тег и релиз создаёт сам
+# GitHub своим токеном.
+#
+# Откуда берётся файл. Исходный код лежит в закрытом репозитории, и его
+# выпуски людям недоступны — скачивать можно только отсюда. Поэтому готовый
+# файл кладётся в этот репозиторий (`apk/Flinks-<версия>.apk`,
+# `win/Flinks-<версия>.exe`), а этот процесс делает из него выпуск.
+# Для приложения можно ничего не класть: с `version` файл скачивается прямо
+# с сайта и перед публикацией сверяется, что это та самая версия. Тогда
+# порядок такой: сначала сайт обновлён, потом выпуск.
+#
+# Заодно для приложения собирается `update.json` — по нему установленное
+# приложение узнаёт о новой версии.
+name: Публикация выпуска
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег: v1.7 — приложение, win-v1.4 — программа'
+        required: true
+      title:
+        description: 'Заголовок (пусто — первая строка releases/<тег>.md)'
+        required: false
+        default: ''
+      file:
+        description: 'Файл из репозитория, например apk/Flinks-1.7.apk'
+        required: false
+        default: ''
+      version:
+        description: 'Версия: 1.7 или 1.4. Для приложения без «файла» она же берётся с сайта'
+        required: false
+        default: ''
+      code:
+        description: 'versionCode приложения — нужен его описанию обновления'
+        required: false
+        default: ''
+      sha256:
+        description: 'Ожидаемая контрольная сумма файла (необязательно)'
+        required: false
+        default: ''
+      recreate:
+        description: 'Пересоздать выпуск, если он уже есть'
+        type: boolean
+        required: false
+        default: false
+      drop:
+        description: 'Только удалить выпуск с этим тегом'
+        type: boolean
+        required: false
+        default: false
+      latest:
+        description: 'Пометить как последний'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  SITE: https://links.iluh.in
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Удалить выпуск
+        if: ${{ inputs.drop }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+            echo "выпуск $TAG удалён"
+          else
+            echo "выпуска $TAG нет — нечего удалять"
+          fi
+
+      - name: Взять заметку к выпуску
+        if: ${{ !inputs.drop }}
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          test -f "releases/$TAG.md" || { echo "нет файла releases/$TAG.md"; exit 1; }
+          mkdir -p dist
+          tail -n +3 "releases/$TAG.md" > dist/notes.md
+          echo "--- заметка ---"; cat dist/notes.md
+
+      - name: Взять файл из репозитория
+        if: ${{ inputs.file != '' && !inputs.drop }}
+        env:
+          FILE: ${{ inputs.file }}
+          WANT_SHA: ${{ inputs.sha256 }}
+        run: |
+          test -f "$FILE" || { echo "нет файла $FILE"; exit 1; }
+          cp "$FILE" dist/
+          GOT=$(sha256sum "dist/$(basename "$FILE")" | cut -d' ' -f1)
+          echo "контрольная сумма: $GOT"
+          if [ -n "$WANT_SHA" ] && [ "$GOT" != "$WANT_SHA" ]; then
+            echo "не та сумма — ожидалась $WANT_SHA"; exit 1
+          fi
+
+      - name: Скачать приложение с сайта
+        if: ${{ inputs.version != '' && inputs.file == '' && !inputs.drop }}
+        env:
+          VERSION: ${{ inputs.version }}
+          WANT_SHA: ${{ inputs.sha256 }}
+        run: |
+          HAVE=$(curl -fsSL "$SITE/update.php?a=check&code=0" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("versionName",""))')
+          echo "на сайте сейчас: $HAVE, нужна: $VERSION"
+          if [ "$HAVE" != "$VERSION" ]; then
+            echo "Сайт отдаёт другую версию — сначала выложите $VERSION, потом публикуйте выпуск."
+            exit 1
+          fi
+          curl -fsSL -o "dist/Flinks-$VERSION.apk" "$SITE/update.php?a=download"
+          # APK — это zip-архив: проверяем подпись «PK» в начале файла.
+          head -c 2 "dist/Flinks-$VERSION.apk" | grep -q '^PK' \
+            || { echo "скачалось не то: это не пакет"; exit 1; }
+          GOT=$(sha256sum "dist/Flinks-$VERSION.apk" | cut -d' ' -f1)
+          echo "контрольная сумма: $GOT"
+          if [ -n "$WANT_SHA" ] && [ "$GOT" != "$WANT_SHA" ]; then
+            echo "Сайт отдал не тот файл — ожидалась сумма $WANT_SHA."
+            exit 1
+          fi
+
+      - name: Собрать описание выпуска для обновлений
+        if: ${{ inputs.version != '' && !inputs.drop }}
+        env:
+          VERSION: ${{ inputs.version }}
+          CODE: ${{ inputs.code }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          # По этому файлу установленное приложение или программа узнаёт, что
+          # вышла новая версия: в нём размер, контрольная сумма и адрес файла.
+          python3 - "$VERSION" "$CODE" "$TAG" <<'PY'
+          import glob, hashlib, json, os, sys
+
+          version, code, tag = sys.argv[1:4]
+          android = not tag.startswith('win-')
+
+          files = glob.glob('dist/*.apk' if android else 'dist/*.exe')
+          if len(files) != 1:
+              raise SystemExit('ожидался ровно один файл выпуска, а их %d' % len(files))
+          path = files[0]
+          data = open(path, 'rb').read()
+          notes = open('dist/notes.md', encoding='utf-8').read().strip()
+
+          out = {
+              'size': len(data),
+              'sha256': hashlib.sha256(data).hexdigest(),
+              'notes': notes,
+              'url': 'https://github.com/%s/releases/download/%s/%s'
+                     % (os.environ['GITHUB_REPOSITORY'], tag, os.path.basename(path)),
+          }
+          if android:
+              if not code:
+                  raise SystemExit('для приложения нужен versionCode')
+              out = dict(ok=True, versionCode=int(code), versionName=version, **out)
+              name = 'dist/update.json'
+          else:
+              out = dict(version=version, **out)
+              name = 'dist/update-windows.json'
+
+          with open(name, 'w', encoding='utf-8') as f:
+              json.dump(out, f, ensure_ascii=False, indent=2)
+              f.write('\n')
+          print(json.dumps({k: v for k, v in out.items() if k != 'notes'},
+                           ensure_ascii=False, indent=2))
+          PY
+
+      - name: Создать выпуск
+        if: ${{ !inputs.drop }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+          LATEST: ${{ inputs.latest }}
+          RECREATE: ${{ inputs.recreate }}
+        run: |
+          [ -n "$TITLE" ] || TITLE="$(head -1 "releases/$TAG.md" | sed 's/^#\+ *//')"
+          FILES=$(ls dist/* | grep -v '/notes.md$' | tr '\n' ' ')
+          echo "файлы выпуска: $FILES"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$RECREATE" != "true" ]; then
+              echo "выпуск $TAG уже есть — добавляю файлы"
+              gh release upload "$TAG" $FILES --clobber
+              exit 0
+            fi
+            echo "пересоздаю $TAG"
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" $FILES \
+            --title "$TITLE" \
+            --notes-file dist/notes.md \
+            --latest=$LATEST
